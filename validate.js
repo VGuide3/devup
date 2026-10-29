@@ -92,10 +92,14 @@ const localBinIn = (dir, name) => {
   const p = path.join(dir, "node_modules", ".bin", name);
   return fs.existsSync(p) ? p : null;
 };
-function runIn(dir, cmd, cmdArgs, label) {
-  const r = spawnSync(cmd, cmdArgs, { cwd: dir, encoding: "utf8" });
+function runIn(dir, cmd, cmdArgs, label, live = false) {
+  if (live) console.log(`  ~ ${label}`);
+  const r = live
+    ? spawnSync(cmd, cmdArgs, { cwd: dir, stdio: ["ignore", "inherit", "inherit"] })
+    : spawnSync(cmd, cmdArgs, { cwd: dir, encoding: "utf8" });
   ran.push(label);
   if (r.status !== 0) {
+    if (live) { err(`${label} failed (see output above)`); return false; }
     const out = ((r.stdout || "") + (r.stderr || "")).trim();
     err(`${label} failed:\n${out.split("\n").slice(0, 15).join("\n")}`);
   }
@@ -174,7 +178,7 @@ for (const dir of pkgDirs) {
     const at = rel(dir) === "." ? "root" : rel(dir);
     if (FIX) {
       const cmd = fs.existsSync(path.join(dir, "package-lock.json")) ? "ci" : "install";
-      if (runIn(dir, "npm", [cmd], `npm ${cmd} (${at})`))
+      if (runIn(dir, "npm", [cmd], `npm ${cmd} (${at})`, true))
         fixed.push(`npm ${cmd} in ${at}`);
     } else {
       err(`[${at}] node_modules missing — run npm ci (or: validate --fix)`);
@@ -395,6 +399,40 @@ if (hardhatDirs.length) {
   }
 }
 
+/* ============ python deps (fixable in --fix) ============ */
+const pyMetaDirs = [...new Set(
+  all.filter((p) => ["pyproject.toml", "requirements.txt"].includes(base(p)))
+    .map((p) => path.dirname(p))
+)].sort();
+const py = which("uv") ? {
+  venv: (dir) => runIn(dir, "uv", ["venv", ".venv"], `uv venv (${rel(dir)})`, true),
+  pip: (dir, a) => runIn(dir, "uv", ["pip", "install", "--python", path.join(dir, ".venv", "bin", "python"), ...a], `uv pip (${rel(dir)})`, true)
+} : which("python3") ? {
+  venv: (dir) => runIn(dir, "python3", ["-m", "venv", ".venv"], `venv (${rel(dir)})`, true),
+  pip: (dir, a) => runIn(dir, path.join(dir, ".venv", "bin", "pip"), ["install", ...a], `pip (${rel(dir)})`, true)
+} : null;
+for (const dir of pyMetaDirs) {
+  const venv = path.join(dir, ".venv");
+  const hasVenv = fs.existsSync(venv);
+  if (fs.existsSync(path.join(dir, "poetry.lock")) && which("poetry")) {
+    if (FIX && !hasVenv) {
+      if (runIn(dir, "poetry", ["install", "--no-interaction"], `poetry install (${rel(dir)})`))
+        fixed.push(`poetry install in ${rel(dir)}`);
+    }
+  } else if (fs.existsSync(path.join(dir, "pyproject.toml")) && !hasVenv) {
+    if (!py) { missing("python3/uv"); continue; }
+    if (FIX && py.venv(dir) && py.pip(dir, ["."]))
+      fixed.push(`.venv + project install in ${rel(dir)}`);
+    else if (!FIX) warnings.push(`[${rel(dir)}] python deps not installed (validate --fix creates .venv)`);
+  } else if (fs.existsSync(path.join(dir, "requirements.txt")) && !hasVenv) {
+    if (!py) { missing("python3/uv"); continue; }
+    if (FIX && py.venv(dir) && py.pip(dir, ["-r", "requirements.txt"]))
+      fixed.push(`.venv + pip install in ${rel(dir)}`);
+    else if (!FIX) warnings.push(`[${rel(dir)}] python deps not installed (validate --fix creates .venv)`);
+  }
+}
+ran.push("py-deps");
+
 /* ============ Python: byte-compile everything ============ */
 if (all.some((p) => p.endsWith(".py"))) {
   if (!which("python3")) missing("python3");
@@ -469,6 +507,39 @@ if (LAUNCH) {
     if (f && which("python3"))
       candidates.push({ dir, cmd: "python3", args: [f], label: `python3 ${f} (${rel(dir)})` });
   }
+  /* pyproject console scripts: poetry run <name> or .venv/bin/<name> */
+  for (const dir of pyMetaDirs) {
+    const pj = path.join(dir, "pyproject.toml");
+    if (!fs.existsSync(pj)) continue;
+    const toml = fs.readFileSync(pj, "utf8");
+    const names = [];
+    for (const sec of toml.matchAll(/\[(?:tool\.poetry\.scripts|project\.scripts)\]([\s\S]*?)(?=\n\[|$)/g))
+      for (const m of sec[1].matchAll(/^([a-z0-9_-]+)\s*=/gim)) names.push(m[1]);
+    if (!names.length) continue;
+    const name = names.find((n) => /web|ui|server|api|app|start|run/.test(n)) || names[0];
+    if (which("poetry") && fs.existsSync(path.join(dir, "poetry.lock")))
+      candidates.push({ dir, cmd: "poetry", args: ["run", name], label: `poetry run ${name} (${rel(dir)})` });
+    else if (fs.existsSync(path.join(dir, ".venv", "bin", name)))
+      candidates.push({ dir, cmd: path.join(dir, ".venv", "bin", name), args: [],
+        env: { PATH: path.join(dir, ".venv", "bin") + ":" + process.env.PATH },
+        label: `.venv ${name} (${rel(dir)})` });
+  }
+  /* python -m <pkg> for packages with __main__.py */
+  for (const dir of dirs) {
+    const pkg = path.basename(dir);
+    if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(pkg) &&
+        fs.existsSync(path.join(dir, "__main__.py")) && which("python3"))
+      candidates.push({ dir: path.dirname(dir), cmd: "python3", args: ["-m", pkg], label: `python3 -m ${pkg} (${rel(dir)})` });
+  }
+  /* Makefile run-ish targets */
+  const mkfile = all.find((p) => base(p) === "Makefile" || base(p) === "makefile");
+  if (mkfile && which("make")) {
+    const mk = fs.readFileSync(mkfile, "utf8");
+    const target = ["run", "start", "dev", "serve", "up"].find((t) =>
+      new RegExp(`^${t}\\s*:`, "m").test(mk));
+    if (target)
+      candidates.push({ dir: path.dirname(mkfile), cmd: "make", args: [target], label: `make ${target} (${rel(path.dirname(mkfile))})` });
+  }
   if (!candidates.length && pages.length && which("python3"))
     candidates.push({ dir: ROOT, cmd: "python3", args: ["-m", "http.server", "8080"], label: "http.server :8080" });
 
@@ -498,12 +569,45 @@ if (LAUNCH) {
       s.close(() => res(p));
     });
   });
+  /* smoke check: watch output for a bound port, then prove it answers HTTP */
+  const probe = (port) => new Promise((resolve) => {
+    const paths = ["/health", "/api/health", "/api/v1", "/"];
+    const attempt = (i) => {
+      const p = paths[i];
+      if (!p) return resolve(0);
+      const req = require("http").get(
+        { host: "localhost", port, path: p, timeout: 3000 },
+        (res) => { res.resume(); resolve(res.statusCode); }
+      );
+      req.on("error", () => attempt(i + 1));
+      req.on("timeout", () => { req.destroy(); attempt(i + 1); });
+    };
+    attempt(0);
+  });
   const tryLaunch = (extraEnv) => new Promise((resolve) => {
     const child = spawn(pick.cmd, pick.args, {
-      cwd: pick.dir, env: { ...globalEnv, ...process.env, ...extraEnv }
+      cwd: pick.dir, env: { ...globalEnv, ...process.env, ...pick.env, ...extraEnv }
     });
     let tail = "";
-    const tee = (d) => { process.stdout.write(d); tail = (tail + d).slice(-8192); };
+    let probed = false;
+    const tee = (d) => {
+      process.stdout.write(d);
+      tail = (tail + d).slice(-8192);
+      if (!probed) {
+        const m = tail.match(/(?:localhost:|port[ =:]+|:(?=\d{4,5}\b))(\d{4,5})/i);
+        if (m) {
+          probed = true;
+          const port = Number(m[1]);
+          setTimeout(async () => {
+            const code = await probe(port);
+            if (code)
+              console.log(`\n  ✓ live: http://localhost:${port}/ answered HTTP ${code}`);
+            else
+              warnings.push(`server bound :${port} but no HTTP response yet`);
+          }, 1500);
+        }
+      }
+    };
     child.stdout.on("data", tee);
     child.stderr.on("data", tee);
     process.on("SIGINT", () => child.kill("SIGINT"));
