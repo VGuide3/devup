@@ -200,10 +200,40 @@ function resolvesImport(fromDir, spec) {
   return false;
 }
 const importRe = /(?:import\s+(?:[^'";]+\s+from\s+)?|import\s*\(|require\s*\(|export\s+[^'";]*\sfrom\s*)['"]([^'"]+)['"]/g;
+
+/* mask comments + string/template interiors to spaces (newlines kept) so
+   fake "import" text inside literals can't false-positive */
+function maskCode(src) {
+  const out = src.split("");
+  let st = 0; // 0 code · 1 // · 2 /* */ · 3 ' · 4 " · 5 `
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i], n = src[i + 1];
+    if (st === 0) {
+      if (c === "/" && n === "/") { out[i] = out[i + 1] = " "; st = 1; i++; }
+      else if (c === "/" && n === "*") { out[i] = out[i + 1] = " "; st = 2; i++; }
+      else if (c === "'") st = 3;
+      else if (c === '"') st = 4;
+      else if (c === "`") st = 5;
+    } else if (st === 1) {
+      if (c === "\n") st = 0; else out[i] = " ";
+    } else if (st === 2) {
+      if (c === "*" && n === "/") { out[i] = out[i + 1] = " "; st = 0; i++; }
+      else if (c !== "\n") out[i] = " ";
+    } else { // inside a string or template literal
+      if (c === "\\") { out[i] = " "; if (n !== "\n") out[i + 1] = " "; i++; }
+      else if ((st === 3 && c === "'") || (st === 4 && c === '"') || (st === 5 && c === "`")) st = 0;
+      else if (c !== "\n") out[i] = " ";
+    }
+  }
+  return out.join("");
+}
+
 for (const f of all.filter((p) => /\.(js|ts|jsx|tsx|mjs|cjs)$/.test(p) && !p.endsWith(".d.ts"))) {
   const src = fs.readFileSync(f, "utf8");
+  const masked = maskCode(src);
   const dir = path.dirname(f);
   for (const m of src.matchAll(importRe)) {
+    if (masked[m.index] === " ") continue; // keyword sits inside a string/comment
     const spec = m[1];
     if (!spec.startsWith(".")) continue; // bare specifiers are package deps, not wiring
     if (!resolvesImport(dir, spec)) err(`${rel(f)} unresolved import: "${spec}"`);
