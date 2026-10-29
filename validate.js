@@ -75,17 +75,36 @@ const missing = (tool) => (STRICT ? err : warnings.push.bind(warnings))(`${tool}
 
 const IGNORE_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", "coverage", "target", "__pycache__", ".venv", "venv", "out"]);
 
+const rel = (p) => path.relative(ROOT, p).split(path.sep).join("/") || ".";
+const has = (f) => fs.existsSync(path.join(ROOT, f));
+
+/* project-declared exclusions: .validateignore (one dir name or path per line)
+   + VALIDATE_IGNORE="a,b" env — archives, clone output, vendored bundles */
+const userIgnore = new Set(
+  (process.env.VALIDATE_IGNORE || "").split(",").map((s) => s.trim().replace(/\/+$/, "")).filter(Boolean)
+);
+if (has(".validateignore")) {
+  for (const l of fs.readFileSync(path.join(ROOT, ".validateignore"), "utf8").split("\n")) {
+    const s = l.trim().replace(/\/+$/, "");
+    if (s && !s.startsWith("#")) userIgnore.add(s);
+  }
+}
+const ignored = (p) => {
+  const r = rel(p), name = path.basename(p);
+  if (userIgnore.has(name)) return true;
+  for (const pn of userIgnore) if (r === pn || r.startsWith(pn + "/")) return true;
+  return false;
+};
+
 function walk(dir, out = []) {
   for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (IGNORE_DIRS.has(ent.name)) continue;
+    if (IGNORE_DIRS.has(ent.name) || ignored(path.join(dir, ent.name))) continue;
     const p = path.join(dir, ent.name);
     if (ent.isDirectory()) walk(p, out);
     else out.push(p);
   }
   return out;
 }
-const rel = (p) => path.relative(ROOT, p).split(path.sep).join("/") || ".";
-const has = (f) => fs.existsSync(path.join(ROOT, f));
 
 const which = (c) => spawnSync("which", [c], { encoding: "utf8" }).status === 0;
 const localBinIn = (dir, name) => {
